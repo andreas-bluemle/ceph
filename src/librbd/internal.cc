@@ -291,6 +291,20 @@ namespace librbd {
     return io_ctx.tmap_update(RBD_DIRECTORY, cmdbl);
   }
 
+  void rollback_object(ImageCtx *ictx, uint64_t snap_id, const string& oid,
+		       SimpleThrottle& throttle)
+  {
+    Context *req_comp = new C_SimpleThrottle(&throttle);
+    librados::AioCompletion *rados_completion =
+      librados::Rados::aio_create_completion(req_comp, NULL, rados_ctx_cb);
+    librados::ObjectWriteOperation op;
+    op.selfmanaged_snap_rollback(snap_id);
+    ictx->data_ctx.aio_operate(oid, rados_completion, &op);
+    ldout(ictx->cct, 10) << "scheduling selfmanaged_snap_rollback on "
+                         << oid << " to " << snap_id << dendl;
+    rados_completion->release();
+  }
+
   int rollback_image(ImageCtx *ictx, uint64_t snap_id,
 		     ProgressContext& prog_ctx)
   {
@@ -307,17 +321,10 @@ namespace librbd {
 
     for (uint64_t i = 0; i < numseg; i++) {
       string oid = ictx->get_object_name(i);
-      Context *req_comp = new C_SimpleThrottle(&throttle);
-      librados::AioCompletion *rados_completion =
-	librados::Rados::aio_create_completion(req_comp, NULL, rados_ctx_cb);
-      librados::ObjectWriteOperation op;
-      op.selfmanaged_snap_rollback(snap_id);
-      ictx->data_ctx.aio_operate(oid, rados_completion, &op);
-      ldout(cct, 10) << "scheduling selfmanaged_snap_rollback on "
-		     << oid << " to " << snap_id << dendl;
-      rados_completion->release();
+      rollback_object(ictx, snap_id, ictx->get_object_name(i), throttle);
       prog_ctx.update_progress(i * bsize, numseg * bsize);
     }
+    rollback_object(ictx, snap_id, object_map_name(ictx->id), throttle);
 
     r = throttle.wait_for_ret();
     if (r < 0) {
@@ -784,6 +791,10 @@ reprotect_and_return_err:
     ostringstream oss;
     CephContext *cct = (CephContext *)io_ctx.cct();
 
+    uint64_t min_stripe_count = max<uint64_t>(1, stripe_count);
+    uint64_t period = min_stripe_count * (1ull << order);
+    uint64_t num_periods = (size + period - 1) / period;
+
     id_obj = id_obj_name(imgname);
 
     int r = io_ctx.create(id_obj, true);
@@ -827,6 +838,15 @@ reprotect_and_return_err:
 	lderr(cct) << "error setting striping parameters: "
 		   << cpp_strerror(r) << dendl;
 	goto err_remove_header;
+      }
+    }
+
+    if ((features & RBD_FEATURE_EXCLUSIVE_LOCK) != 0) {
+      r = cls_client::object_map_resize(&io_ctx, object_map_name(id),
+ 				        num_periods * min_stripe_count,
+				        OBJECT_NONEXISTENT);
+      if (r < 0) {
+        goto err_remove_header;
       }
     }
 
@@ -1473,6 +1493,11 @@ reprotect_and_return_err:
       }
     }
     if (!old_format) {
+      r = io_ctx.remove(object_map_name(id));
+      if (r < 0 && r != -ENOENT) {
+	lderr(cct) << "error removing image object map" << dendl;
+      }
+
       ldout(cct, 2) << "removing id object..." << dendl;
       r = io_ctx.remove(id_obj_name(imgname));
       if (r < 0 && r != -ENOENT) {
@@ -1548,6 +1573,8 @@ reprotect_and_return_err:
     }
 
     virtual void finish(int r) {
+      m_ictx->resize_object_map(OBJECT_NONEXISTENT);
+
       ldout(m_ictx->cct, 2) << "async_resize finished" << dendl;
       m_ictx->perfcounter->inc(l_librbd_resize);
       m_ctx->complete(r);
@@ -1711,6 +1738,10 @@ reprotect_and_return_err:
         return -EROFS;
       }
 
+      if (!m_ictx->object_may_exist(m_object_no)) {
+	return 1;
+      }
+
       string oid = m_ictx->get_object_name(m_object_no);
       librados::AioCompletion *rados_completion =
 	librados::Rados::aio_create_completion(this, NULL, rados_ctx_cb);
@@ -1737,7 +1768,7 @@ reprotect_and_return_err:
     }
 
     virtual void finish(int r) {
-      if (r < 0 || m_delete_offset <= m_new_size) {
+      if (r < 0) {
 	m_ctx->complete(r);
 	return;
       }
@@ -1746,6 +1777,14 @@ reprotect_and_return_err:
       if (m_ictx->image_watcher->is_lock_supported() &&
           !m_ictx->image_watcher->is_lock_owner()) {
 	r = -EROFS;
+	m_ctx->complete(-EROFS);
+	return;
+      }
+
+      m_ictx->update_object_map(m_delete_start, m_num_objects,
+				OBJECT_NONEXISTENT, OBJECT_PENDING);
+      if (m_delete_offset <= m_new_size) {
+	m_ctx->complete(r);
 	return;
       }
 
@@ -1762,14 +1801,28 @@ reprotect_and_return_err:
 	Context *req_comp = new C_ContextCompletion(*completion);
 	librados::AioCompletion *rados_completion =
 	  librados::Rados::aio_create_completion(req_comp, NULL, rados_ctx_cb);
+
+	bool flag_nonexistent = false;
 	if (p->offset == 0) {
+	  // TODO: JD if the image as snapshots, do we need to keep the
+	  // object flagged as existing? How does RADOS know to delete
+	  // old snapshot objects?
+	  flag_nonexistent = true;
+	  m_ictx->update_object_map(p->objectno, p->objectno + 1,
+				    OBJECT_PENDING, OBJECT_EXISTS);
 	  m_ictx->data_ctx.aio_remove(p->oid.name, rados_completion);
 	} else {
+	  m_ictx->update_object_map(p->objectno, OBJECT_EXISTS);
 	  librados::ObjectWriteOperation op;
 	  op.truncate(p->offset);
 	  m_ictx->data_ctx.aio_operate(p->oid.name, rados_completion, &op);
 	}
 	rados_completion->release();
+
+	if (flag_nonexistent) {
+	  m_ictx->update_object_map(p->objectno, p->objectno + 1,
+				    OBJECT_NONEXISTENT, OBJECT_PENDING);
+	}
       }
       completion->finish_adding_requests();
     }
@@ -1808,6 +1861,9 @@ reprotect_and_return_err:
     if (delete_start < num_objects) {
       ldout(cct, 2) << "trim_image objects " << delete_start << " to "
 		    << (num_objects - 1) << dendl;
+
+      ictx->update_object_map(delete_start, num_objects, OBJECT_PENDING,
+			      OBJECT_EXISTS);
 
       AsyncObjectThrottle::ContextFactory context_factory(
         boost::lambda::bind(boost::lambda::new_ptr<AsyncTrimObjectContext>(),
@@ -1982,9 +2038,9 @@ reprotect_and_return_err:
     vector<parent_info> snap_parents;
     vector<uint8_t> snap_protection;
     {
+      int r;
       RWLock::WLocker l(ictx->snap_lock);
       {
-        int r;
 	RWLock::WLocker l2(ictx->parent_lock);
 	ictx->lockers.clear();
 	if (ictx->old_format) {
@@ -2111,6 +2167,13 @@ reprotect_and_return_err:
 	lderr(cct) << "tried to read from a snapshot that no longer exists: "
 		   << ictx->snap_name << dendl;
 	ictx->snap_exists = false;
+      }
+
+      if (ictx->snap_exists) {
+	r = ictx->refresh_object_map();
+	if (r < 0) {
+	  return r;
+	}
       }
 
       ictx->data_ctx.selfmanaged_snap_set_write_ctx(ictx->snapc.seq, ictx->snaps);
@@ -2406,6 +2469,7 @@ reprotect_and_return_err:
       }
     }
 
+    ictx->refresh_object_map();
     refresh_parent(ictx);
     return 0;
   }
@@ -2726,6 +2790,9 @@ reprotect_and_return_err:
 	// TODO: temporary until request proxied to lock owner
 	return -EROFS;
       }
+
+      ictx->update_object_map(0, overlap_objects, OBJECT_EXISTS,
+			      boost::optional<uint8_t>());
     }
 
     AsyncObjectThrottle::ContextFactory context_factory(
@@ -3473,6 +3540,11 @@ reprotect_and_return_err:
 	bl.append(buf + q->first, q->second);
       }
 
+      r = ictx->update_object_map(p->objectno, OBJECT_EXISTS);
+      if (r < 0) {
+	goto done;
+      }
+
       C_AioWrite *req_comp = new C_AioWrite(cct, c);
       if (ictx->object_cacher) {
 	c->add_request();
@@ -3570,9 +3642,15 @@ reprotect_and_return_err:
 	object_overlap = ictx->prune_parent_extents(objectx, overlap);
       }
 
+      bool flag_nonexistent = false;
       if (p->offset == 0 && p->length == ictx->layout.fl_object_size) {
 	req = new AioRemove(ictx, p->oid.name, p->objectno, objectx, object_overlap,
 			    snapc, snap_id, req_comp);
+	if (!req->has_parent()) {
+          ictx->update_object_map(p->objectno, p->objectno + 1, OBJECT_PENDING,
+				  OBJECT_EXISTS);
+	  flag_nonexistent = true;
+	}
       } else if (p->offset + p->length == ictx->layout.fl_object_size) {
 	req = new AioTruncate(ictx, p->oid.name, p->objectno, p->offset, objectx, object_overlap,
 			      snapc, snap_id, req_comp);
@@ -3582,9 +3660,18 @@ reprotect_and_return_err:
 			  snapc, snap_id, req_comp);
       }
 
+      if (!flag_nonexistent) {
+	ictx->update_object_map(p->objectno, OBJECT_EXISTS);
+      }
+
       r = req->send();
       if (r < 0)
 	goto done;
+
+      if (flag_nonexistent) {
+	ictx->update_object_map(p->objectno, p->objectno + 1, OBJECT_NONEXISTENT,
+				OBJECT_PENDING);
+      }
     }
     r = 0;
   done:
@@ -3668,7 +3755,7 @@ reprotect_and_return_err:
 
 	  Context *req_comp = new C_RBD_Readahead(ictx, q->oid, q->offset, q->length);
 	  ictx->readahead.inc_pending();
-	  ictx->aio_read_from_cache(q->oid, NULL,
+	  ictx->aio_read_from_cache(q->oid, q->objectno, NULL,
 				    q->length, q->offset,
 				    req_comp);
 	}
@@ -3741,7 +3828,7 @@ reprotect_and_return_err:
 
 	if (ictx->object_cacher) {
 	  C_CacheRead *cache_comp = new C_CacheRead(req);
-	  ictx->aio_read_from_cache(q->oid, &req->data(),
+	  ictx->aio_read_from_cache(q->oid, q->objectno, &req->data(),
 				    q->length, q->offset,
 				    cache_comp);
 	} else {
