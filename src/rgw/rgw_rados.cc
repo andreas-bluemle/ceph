@@ -4284,8 +4284,6 @@ int RGWRados::prepare_get_obj(void *ctx, rgw_obj& obj,
         ldout(cct, 20) << "Read xattr: " << iter->first << dendl;
       }
     }
-    if (r < 0)
-      goto done_err;
   }
 
   /* Convert all times go GMT to make them compatible */
