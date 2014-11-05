@@ -95,6 +95,7 @@ protected:
    * @param new_rval The return code to use.
    */
   void set_rval(int new_rval) { rval = new_rval; }
+  int get_rval() { return rval; }
 
   /**
    * Register member functions as associated with a given stage. Start
@@ -107,6 +108,17 @@ protected:
     assert(callbacks.find(stage) == callbacks.end());
     callbacks[stage] = func;
   }
+  
+  /**
+   * Called when the Continuation is done, as determined by a stage returning
+   * true and us having finished all the currently-processing ones.
+   */
+   virtual void _done() {
+     on_finish->complete(rval);
+     on_finish = NULL;
+     delete this;
+     return;
+   }
 
 private:
   std::map<int, Continuation::stagePtr> callbacks;
@@ -136,10 +148,7 @@ private:
 
     if (done ||
         (reported_done && stages_processing.empty())) {
-      on_finish->complete(rval);
-      on_finish = NULL;
-      delete this;
-      return;
+      _done();
     }
   }
 
