@@ -321,10 +321,6 @@ void MDS::command_flush_path(Formatter *f, const string& path)
   int r = scond.wait();
   f->open_object_section("results");
   f->dump_int("return_code", r);
-  if (r) // something went wrong
-    f->dump_bool("success", false);
-  else
-    f->dump_bool("success", true);
   f->close_section(); // results
 }
 
