@@ -449,6 +449,8 @@ public:
 
   int statfs(struct statfs *buf);
 
+  void _coalesce( map<string, bufferlist> &target, map<string, bufferlist> &source);
+
   int _do_transactions(
     list<Transaction*> &tls, uint64_t op_seq,
     ThreadPool::TPHandle *handle);

@@ -2308,6 +2308,16 @@ int FileStore::_check_replay_guard(int fd, const SequencerPosition& spos)
   }
 }
 
+void FileStore::_coalesce(map<string, bufferlist> &target, map<string, bufferlist> &source)
+{
+  for (map<string, bufferlist>::iterator p = source.begin();
+       p != source.end();
+       p++) {
+    target[p->first] = p->second;
+  }
+  return;
+}
+
 #define TP_FSTORE_DO_TA_START              0
 #define TP_FSTORE_DO_TA_OTHER_OP_START     1
 #define TP_FSTORE_DO_TA_OTHER_OP_END       2
@@ -2323,6 +2333,9 @@ unsigned FileStore::_do_transaction(
 {
   uint64_t tp_stamps[8] = {0,0,0,0,0,0};
   int32_t tp_nops = 0;
+  map<string, bufferlist> collected_aset;
+  coll_t collected_cid;
+  ghobject_t collected_oid;
 
   dout(10) << "_do_transaction on " << &t << dendl;
 
@@ -2343,6 +2356,25 @@ unsigned FileStore::_do_transaction(
     int r = 0;
 
     _inject_failure();
+
+    if (op->op == Transaction::OP_OMAP_SETKEYS) {
+	collected_cid = i.get_cid(op->cid);
+	collected_oid = i.get_oid(op->oid);
+	map<string, bufferlist> aset;
+	i.decode_attrset(aset);
+	_coalesce(collected_aset, aset);
+	continue;
+    } else {
+	if (collected_aset.empty() == false) {
+          set_tp_stamp(tp_stamps[TP_FSTORE_DO_TA_OTHER_OP_START], ceph_clock_now(g_ceph_context).to_nsec()/1000);
+	  tracepoint(objectstore, omap_setkeys_enter, osr_name);
+	  r = _omap_setkeys(collected_cid, collected_oid, collected_aset, spos);
+	  tracepoint(objectstore, omap_setkeys_exit, r);
+	  collected_aset.clear();
+          set_tp_stamp(tp_stamps[TP_FSTORE_DO_TA_OTHER_OP_END], ceph_clock_now(g_ceph_context).to_nsec()/1000);
+          tracepoint(filestore, do_transaction, pthread_self(), op_seq, trans_num, "unknown", "", 0, 0,  op->op, tp_nops, tp_stamps);
+	}
+    }
 
     if (op->op != Transaction::OP_WRITE) {
       set_tp_stamp(tp_stamps[TP_FSTORE_DO_TA_OTHER_OP_START], ceph_clock_now(g_ceph_context).to_nsec()/1000);
