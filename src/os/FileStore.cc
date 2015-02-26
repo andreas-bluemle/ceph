@@ -2335,6 +2335,7 @@ unsigned FileStore::_do_transaction(
   
   SequencerPosition spos(op_seq, trans_num, 0);
   while (i.have_op()) {
+    tp_nops++;
     if (handle)
       handle->reset_tp_timeout();
 
@@ -2370,12 +2371,14 @@ unsigned FileStore::_do_transaction(
         uint64_t len = op->len;
         uint32_t fadvise_flags = i.get_fadvise_flags();
         bufferlist bl;
+        set_tp_stamp(tp_stamps[TP_FSTORE_DO_TA_WRITE_DECODE_START], ceph_clock_now(g_ceph_context).to_nsec()/1000);
         i.decode_bl(bl);
         set_tp_stamp(tp_stamps[TP_FSTORE_DO_TA_WRITE_DECODE_END], ceph_clock_now(g_ceph_context).to_nsec()/1000);
         tracepoint(objectstore, write_enter, osr_name, off, len);
         if (_check_replay_guard(cid, oid, spos) > 0)
           r = _write(cid, oid, off, len, bl, fadvise_flags);
         set_tp_stamp(tp_stamps[TP_FSTORE_DO_TA_WRITE_END], ceph_clock_now(g_ceph_context).to_nsec()/1000);
+	tracepoint(filestore, do_transaction, pthread_self(), op_seq, trans_num, oid.hobj.oid.name.c_str(), cid.c_str(), off, len, op->op, tp_nops, tp_stamps);
         tracepoint(objectstore, write_exit, r);
       }
       break;
@@ -4062,6 +4065,13 @@ int FileStore::getattrs(coll_t cid, const ghobject_t& oid, map<string,bufferptr>
   }
 }
 
+#define TP_FSTORE_SETATTRS_START              0
+#define TP_FSTORE_SETATTRS_LFN_OPEN           1
+#define TP_FSTORE_SETATTRS_GOTATTRS           2
+#define TP_FSTORE_SETATTRS_DOIT               3
+#define TP_FSTORE_SETATTRS_DIDIT              4
+#define TP_FSTORE_SETATTRS_DONE               5
+
 int FileStore::_setattrs(coll_t cid, const ghobject_t& oid, map<string,bufferptr>& aset,
 			 const SequencerPosition &spos)
 {
@@ -4072,11 +4082,17 @@ int FileStore::_setattrs(coll_t cid, const ghobject_t& oid, map<string,bufferptr
   FDRef fd;
   int spill_out = -1;
   bool incomplete_inline = false;
+  uint64_t tp_stamps[6] = {0,0,0,0,0,0};
+  int32_t tp_n_attrs = 0;
+  int32_t tp_attrs_len = 0;
+  string tp_attrs;
 
+  set_tp_stamp(tp_stamps[TP_FSTORE_SETATTRS_START], ceph_clock_now(g_ceph_context).to_nsec()/1000);
   int r = lfn_open(cid, oid, false, &fd);
   if (r < 0) {
     goto out;
   }
+  set_tp_stamp(tp_stamps[TP_FSTORE_SETATTRS_LFN_OPEN], ceph_clock_now(g_ceph_context).to_nsec()/1000);
 
   char buf[2];
   r = chain_fgetxattr(**fd, XATTR_SPILL_OUT_NAME, buf, sizeof(buf));
@@ -4086,6 +4102,7 @@ int FileStore::_setattrs(coll_t cid, const ghobject_t& oid, map<string,bufferptr
     spill_out = 1;
 
   r = _fgetattrs(**fd, inline_set);
+  set_tp_stamp(tp_stamps[TP_FSTORE_SETATTRS_GOTATTRS], ceph_clock_now(g_ceph_context).to_nsec()/1000);
   incomplete_inline = (r == -E2BIG);
   assert(!m_filestore_fail_eio || r != -EIO);
   dout(15) << "setattrs " << cid << "/" << oid
@@ -4096,7 +4113,9 @@ int FileStore::_setattrs(coll_t cid, const ghobject_t& oid, map<string,bufferptr
        p != aset.end();
        ++p) {
     char n[CHAIN_XATTR_MAX_NAME_LEN];
+    tp_n_attrs++;
     get_attrname(p->first.c_str(), n, CHAIN_XATTR_MAX_NAME_LEN);
+    tp_attrs += n; tp_attrs += ",";
 
     if (incomplete_inline) {
       chain_fremovexattr(**fd, n); // ignore any error
@@ -4104,6 +4123,7 @@ int FileStore::_setattrs(coll_t cid, const ghobject_t& oid, map<string,bufferptr
       continue;
     }
 
+    tp_attrs_len += p->second.length();
     if (p->second.length() > m_filestore_max_inline_xattr_size) {
 	if (inline_set.count(p->first)) {
 	  inline_set.erase(p->first);
@@ -4131,7 +4151,9 @@ int FileStore::_setattrs(coll_t cid, const ghobject_t& oid, map<string,bufferptr
 		    sizeof(XATTR_SPILL_OUT));
   }
 
+  set_tp_stamp(tp_stamps[TP_FSTORE_SETATTRS_DOIT], ceph_clock_now(g_ceph_context).to_nsec()/1000);
   r = _fsetattrs(**fd, inline_to_set);
+  set_tp_stamp(tp_stamps[TP_FSTORE_SETATTRS_DIDIT], ceph_clock_now(g_ceph_context).to_nsec()/1000);
   if (r < 0)
     goto out_close;
 
@@ -4157,6 +4179,8 @@ int FileStore::_setattrs(coll_t cid, const ghobject_t& oid, map<string,bufferptr
  out_close:
   lfn_close(fd);
  out:
+  set_tp_stamp(tp_stamps[TP_FSTORE_SETATTRS_DONE], ceph_clock_now(g_ceph_context).to_nsec()/1000);
+  tracepoint(filestore, setattrs, pthread_self(), spos.seq, oid.hobj.oid.name.c_str(), cid.c_str(), tp_n_attrs, tp_attrs_len, tp_attrs.c_str(), tp_stamps);
   dout(10) << "setattrs " << cid << "/" << oid << " = " << r << dendl;
   return r;
 }
@@ -5065,26 +5089,54 @@ int FileStore::_omap_clear(coll_t cid, const ghobject_t &hoid,
   return 0;
 }
 
+#define TP_FSTORE_OMAP_SETKEYS_START              0
+#define TP_FSTORE_OMAP_SETKEYS_GOT_INDEX          1
+#define TP_FSTORE_OMAP_SETKEYS_GOT_LOCK           2
+#define TP_FSTORE_OMAP_SETKEYS_GOT_LFN            3
+#define TP_FSTORE_OMAP_SETKEYS_DOIT               4
+#define TP_FSTORE_OMAP_SETKEYS_DONE               5
+
 int FileStore::_omap_setkeys(coll_t cid, const ghobject_t &hoid,
-			     const map<string, bufferlist> &aset,
+			     map<string, bufferlist> &aset,
 			     const SequencerPosition &spos) {
+  uint64_t tp_stamps[6] = {0,0,0,0,0,0};
+  int32_t tp_attrs_len = 0;
+  int32_t tp_n_attrs = 0;
+  string tp_attrs;
+
   dout(15) << __func__ << " " << cid << "/" << hoid << dendl;
+  set_tp_stamp(tp_stamps[TP_FSTORE_OMAP_SETKEYS_START], ceph_clock_now(g_ceph_context).to_nsec()/1000);
   Index index;
   int r = get_index(cid, &index);
   if (r < 0) {
     dout(20) << __func__ << " get_index got " << cpp_strerror(r) << dendl;
     return r;
   }
+  set_tp_stamp(tp_stamps[TP_FSTORE_OMAP_SETKEYS_GOT_INDEX], ceph_clock_now(g_ceph_context).to_nsec()/1000);
   {
     assert(NULL != index.index);
     RWLock::RLocker l((index.index)->access_lock);
+    set_tp_stamp(tp_stamps[TP_FSTORE_OMAP_SETKEYS_GOT_LOCK], ceph_clock_now(g_ceph_context).to_nsec()/1000);
     r = lfn_find(hoid, index);
     if (r < 0) {
       dout(20) << __func__ << " lfn_find got " << cpp_strerror(r) << dendl;
       return r;
     }
   }
+  set_tp_stamp(tp_stamps[TP_FSTORE_OMAP_SETKEYS_GOT_LFN], ceph_clock_now(g_ceph_context).to_nsec()/1000);
+  for (map<string,bufferlist>::iterator p = aset.begin();
+       p != aset.end();
+       ++p) {
+    char n[CHAIN_XATTR_MAX_NAME_LEN];
+    get_attrname(p->first.c_str(), n, CHAIN_XATTR_MAX_NAME_LEN);
+    tp_attrs += n; tp_attrs += ",";
+    tp_n_attrs++;
+    tp_attrs_len += p->second.length();
+  }
+  set_tp_stamp(tp_stamps[TP_FSTORE_OMAP_SETKEYS_DOIT], ceph_clock_now(g_ceph_context).to_nsec()/1000);
   r = object_map->set_keys(hoid, aset, &spos);
+  set_tp_stamp(tp_stamps[TP_FSTORE_OMAP_SETKEYS_DONE], ceph_clock_now(g_ceph_context).to_nsec()/1000);
+  tracepoint(filestore, omap_setkeys, spos.seq, pthread_self(), hoid.hobj.oid.name.c_str(), cid.c_str(), tp_n_attrs, tp_attrs_len, tp_attrs.c_str(), tp_stamps);
   dout(20) << __func__ << " " << cid << "/" << hoid << " = " << r << dendl;
   return r;
 }

@@ -32,7 +32,6 @@ TRACEPOINT_EVENT(filestore, do_transactions,
     TP_FIELDS(
         ctf_integer(uint64_t, threadid, threadid)
         ctf_integer(uint64_t, op_seq, op_seq)
-        ctf_integer(int32_t, trans_num, trans_num)
         ctf_array(uint64_t, stamps, stamps, 4)
     )
 )
@@ -60,5 +59,49 @@ TRACEPOINT_EVENT(filestore, do_transaction,
         ctf_integer(int32_t, tp_op, tp_op)
         ctf_integer(int32_t, tp_nops, tp_nops)
         ctf_array(uint64_t, stamps, stamps, 8)
+    )
+)
+
+TRACEPOINT_EVENT(filestore, setattrs,
+    TP_ARGS(
+        uint64_t, threadid,
+        uint64_t, op_seq,
+        const char*,  oid,
+        const char*,  cid,
+        int32_t, n_attr,
+        int32_t, attr_len,
+        const char*,  attrs,
+        uint64_t *, stamps),
+    TP_FIELDS(
+        ctf_integer(uint64_t, threadid, threadid)
+        ctf_integer(uint64_t, op_seq, op_seq)
+        ctf_string(oid, oid)
+        ctf_string(cid, cid)
+        ctf_integer(int32_t, n_attr, n_attr)
+        ctf_integer(int32_t, attr_len, attr_len)
+        ctf_string(attrs, attrs)
+        ctf_array(uint64_t, stamps, stamps, 6)
+    )
+)
+
+TRACEPOINT_EVENT(filestore, omap_setkeys,
+    TP_ARGS(
+        uint64_t, threadid,
+        uint64_t, op_seq,
+        const char*,  oid,
+        const char*,  cid,
+        int32_t, n_attr,
+        int32_t, attr_len,
+        const char*,  attrs,
+        uint64_t *, stamps),
+    TP_FIELDS(
+        ctf_integer(uint64_t, threadid, threadid)
+        ctf_integer(uint64_t, op_seq, op_seq)
+        ctf_string(oid, oid)
+        ctf_string(cid, cid)
+        ctf_integer(int32_t, n_attr, n_attr)
+        ctf_integer(int32_t, attr_len, attr_len)
+        ctf_string(attrs, attrs)
+        ctf_array(uint64_t, stamps, stamps, 6)
     )
 )

@@ -661,7 +661,7 @@ private:
   int _omap_clear(coll_t cid, const ghobject_t &oid,
 		  const SequencerPosition &spos);
   int _omap_setkeys(coll_t cid, const ghobject_t &oid,
-		    const map<string, bufferlist> &aset,
+		    map<string, bufferlist> &aset,
 		    const SequencerPosition &spos);
   int _omap_rmkeys(coll_t cid, const ghobject_t &oid, const set<string> &keys,
 		   const SequencerPosition &spos);
